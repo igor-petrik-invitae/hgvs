@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Tests uta postgresql client"""
 
 from __future__ import absolute_import, division, print_function, unicode_literals
@@ -6,15 +5,19 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 import os
 import re
 import unittest
+from unittest.mock import MagicMock, patch
 
-from hgvs.exceptions import HGVSDataNotAvailableError
+import psycopg2
+import pytest
+from support import CACHE
+
 import hgvs.dataproviders.uta
 import hgvs.edit
 import hgvs.location
 import hgvs.posedit
-import hgvs.variantmapper
 import hgvs.sequencevariant
-from support import CACHE
+import hgvs.variantmapper
+from hgvs.exceptions import HGVSDataNotAvailableError, HGVSError
 
 
 class UTA_Base(object):
@@ -126,6 +129,111 @@ class TestUTACache(Test_hgvs_dataproviders_uta_UTA_default):
         var1 = self._create_cdna_variant()
         var2 = self._create_cdna_variant()
         self.assertEqual(str(var1), str(var2))
+
+
+class Test_hgvs_dataproviders_uta_with_pooling_without_cache(unittest.TestCase, UTA_Base):
+    """
+    Currently used to test pool errors, since we need to reach out to
+    the database and not use the cache
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hdp = hgvs.dataproviders.uta.connect(pooling=True)
+
+
+class TestUTAPool(Test_hgvs_dataproviders_uta_with_pooling_without_cache):
+    def test_use_putconn_on_lost_conn(self):
+        """
+        Check that it won't closeall instead of putconn for pooling
+        when it loses the connection
+        """
+
+        def raise_operational_error(*args, **kwargs):
+            raise psycopg2.OperationalError()
+
+        with patch.object(self.hdp, "_pool") as mock_pool:
+            mock_getconn = mock_pool.getconn.return_value
+            mock_putconn = mock_pool.putconn
+            mock_getconn.cursor.side_effect = raise_operational_error
+            with pytest.raises(HGVSError):
+                self.hdp.get_gene_info("PAH")
+            mock_putconn.assert_called_with(mock_getconn)
+
+
+def _make_uta_stub(pooling):
+    """UTA_postgresql instance wired with mocks, without connecting."""
+    hdp = object.__new__(hgvs.dataproviders.uta.UTA_postgresql)
+    hdp.pooling = pooling
+    hdp.url = MagicMock()
+    hdp.url.schema = "uta"
+    hdp._conns_seen = set()
+    hdp._connect = MagicMock()
+
+    cur = MagicMock(name="cursor")
+    conn = MagicMock(name="connection")
+    conn.cursor.return_value = cur
+
+    if pooling:
+        hdp._pool = MagicMock(name="pool")
+        hdp._pool.getconn.return_value = conn
+    else:
+        hdp._conn = conn
+
+    return hdp, conn, cur
+
+
+class TestUTAGetCursorContextManager:
+    def test_success_yields_cursor_and_cleans_up_pooling(self):
+        hdp, conn, cur = _make_uta_stub(pooling=True)
+
+        with hdp._get_cursor() as c:
+            assert c is cur
+
+        cur.close.assert_called_once_with()
+        hdp._pool.putconn.assert_called_once_with(conn)
+
+    def test_success_closes_cursor_without_pooling(self):
+        hdp, _conn, cur = _make_uta_stub(pooling=False)
+
+        with hdp._get_cursor() as c:
+            assert c is cur
+
+        cur.close.assert_called_once_with()
+
+    def test_consumer_exception_propagates_and_cleans_up(self):
+        hdp, conn, cur = _make_uta_stub(pooling=True)
+
+        with pytest.raises(ValueError, match="boom"), hdp._get_cursor():
+            raise ValueError("boom")
+
+        cur.close.assert_called_once_with()
+        hdp._pool.putconn.assert_called_once_with(conn)
+
+    def test_acquisition_operational_error_retries_then_raises(self):
+        """OperationalError while acquiring the cursor triggers reconnect
+        and, once retries are exhausted, raises HGVSError."""
+        hdp, conn, cur = _make_uta_stub(pooling=False)
+        conn.cursor.side_effect = psycopg2.OperationalError("lost")
+
+        with pytest.raises(HGVSError), hdp._get_cursor(n_retries=1):
+            pass
+
+        assert hdp._connect.call_count == 2
+
+    def test_consumer_operational_error_is_not_swallowed_by_retry(self):
+        """An OperationalError raised *inside* the ``with`` block must
+        propagate rather than being caught by the acquisition retry logic
+        (which previously re-entered the generator and raised
+        "generator didn't stop")."""
+        hdp, _conn, cur = _make_uta_stub(pooling=False)
+
+        with pytest.raises(psycopg2.OperationalError), hdp._get_cursor():
+            raise psycopg2.OperationalError("query failed")
+
+        hdp._connect.assert_not_called()
+        cur.close.assert_called_once_with()
+
 
 
 if __name__ == "__main__":
